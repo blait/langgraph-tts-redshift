@@ -1,12 +1,11 @@
 import streamlit as st
 import boto3
-from langchain_aws import BedrockChat
+from langchain_aws import BedrockLLM
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 import pandas as pd
 import psycopg2
-from langchain_experimental.graph import StateGraph
-from langchain_experimental.graph.graph import END
+from langgraph.graph import StateGraph, END
 import json
 import os
 from dotenv import load_dotenv
@@ -27,7 +26,7 @@ bedrock_client = boto3.client(
     region_name=os.getenv("AWS_REGION", "us-west-2")
 )
 
-llm = BedrockChat(
+llm = BedrockLLM(
     client=bedrock_client,
     model_id="anthropic.claude-3-7-sonnet-20240229-v1:0",
     model_kwargs={"temperature": 0.2, "max_tokens": 4000}
