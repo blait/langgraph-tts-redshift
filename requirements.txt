@@ -1,0 +1,8 @@
+streamlit
+boto3
+langchain
+langchain-aws
+langchain-experimental
+pandas
+psycopg2-binary
+python-dotenv
