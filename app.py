@@ -6,7 +6,7 @@ from langchain_core.prompts import ChatPromptTemplate
 import pandas as pd
 import psycopg2
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Optional, List, Dict
+from typing import TypedDict, Optional, List, Dict, Any, Callable
 import json
 import os
 from dotenv import load_dotenv
@@ -21,7 +21,19 @@ redshift_dbname = os.getenv("REDSHIFT_DBNAME")
 redshift_user = os.getenv("REDSHIFT_USER")
 redshift_password = os.getenv("REDSHIFT_PASSWORD")
 
-# Bedrock 클라이언트 초기화 (Claude 3.7)
+# Streamlit 상태 초기화
+if "progress_placeholder" not in st.session_state:
+    st.session_state.progress_placeholder = None
+if "current_step" not in st.session_state:
+    st.session_state.current_step = ""
+
+# 진행 상황 업데이트 함수
+def update_progress(step: str, message: str, code: str = None):
+    if "progress_placeholder" in st.session_state and st.session_state.progress_placeholder:
+        with st.session_state.progress_placeholder:
+            st.write(f"{message}")
+            if code:
+                st.code(code, language="sql")# Bedrock 클라이언트 초기화 (Claude 3.7)
 bedrock_client = boto3.client(
     service_name="bedrock-runtime",
     region_name=os.getenv("AWS_REGION", "us-west-2")
@@ -136,12 +148,13 @@ def execute_sql(sql):
 
 # LangGraph 노드
 def generate_sql(state):
-    st.write("🔄 SQL 생성 중...")
+    # 진행 상황 업데이트
+    update_progress("generate_sql", "🔄 SQL 생성 중...")
     
     # 재시도 횟수 추적
     retry_count = state.get("retry_count", 0)
     if retry_count >= 3:
-        st.write("⚠️ 최대 재시도 횟수 초과. 프로세스를 중단합니다.")
+        update_progress("generate_sql", "⚠️ 최대 재시도 횟수 초과. 프로세스를 중단합니다.")
         return {"sql": "-- 최대 재시도 횟수 초과", "error_feedback": "최대 재시도 횟수를 초과했습니다."}
     
     schema = get_table_schema()
@@ -164,7 +177,7 @@ def generate_sql(state):
     
     error_feedback = state.get("error_feedback", "")
     if error_feedback:
-        st.write(f"⚠️ 이전 오류: {error_feedback}")
+        update_progress("generate_sql", f"⚠️ 이전 오류: {error_feedback}")
     
     try:
         chain = prompt | llm
@@ -179,15 +192,14 @@ def generate_sql(state):
         if sql.startswith("```sql"):
             sql = sql.replace("```sql", "").replace("```", "").strip()
         
-        st.write("✅ SQL 생성 완료")
-        st.code(sql, language="sql")
-        return {"sql": sql, "retry_count": retry_count}
+        update_progress("generate_sql", "✅ SQL 생성 완료", sql)
+        return {"sql": sql}
     except Exception as e:
-        st.write(f"❌ SQL 생성 오류: {str(e)}")
+        update_progress("generate_sql", f"❌ SQL 생성 오류: {str(e)}")
         return {"sql": "", "error_feedback": f"SQL 생성 중 오류 발생: {str(e)}", "retry_count": retry_count + 1}
 
 def validate_sql_node(state):
-    st.write("🔄 SQL 검증 중...")
+    update_progress("validate_sql", "🔄 SQL 검증 중...")
     sql = state["sql"]
     
     # 재시도 횟수 가져오기
@@ -196,10 +208,10 @@ def validate_sql_node(state):
     is_valid, error_message = validate_sql(sql)
     
     if is_valid:
-        st.write("✅ SQL 검증 성공")
-        return {"is_valid": True, "retry_count": retry_count}
+        update_progress("validate_sql", "✅ SQL 검증 성공")
+        return {"is_valid": True}
     else:
-        st.write(f"❌ SQL 검증 실패: {error_message}")
+        update_progress("validate_sql", f"❌ SQL 검증 실패: {error_message}")
         return {
             "is_valid": False,
             "error_feedback": f"SQL 검증 실패: {error_message}. SQL 쿼리를 수정해주세요.",
@@ -207,7 +219,7 @@ def validate_sql_node(state):
         }
 
 def execute_sql_node(state):
-    st.write("🔄 SQL 실행 중...")
+    update_progress("execute_sql", "🔄 SQL 실행 중...")
     sql = state["sql"]
     
     # 재시도 횟수 가져오기
@@ -218,10 +230,10 @@ def execute_sql_node(state):
     if df is not None:
         # DataFrame을 JSON 직렬화를 위해 딕셔너리로 변환
         results = df.to_dict(orient="records")
-        st.write(f"✅ SQL 실행 성공: {len(results)}개의 결과 반환")
-        return {"results": results, "execution_successful": True, "retry_count": retry_count}
+        update_progress("execute_sql", f"✅ SQL 실행 성공: {len(results)}개의 결과 반환")
+        return {"results": results, "execution_successful": True}
     else:
-        st.write(f"❌ SQL 실행 실패: {error}")
+        update_progress("execute_sql", f"❌ SQL 실행 실패: {error}")
         return {
             "execution_successful": False,
             "error_feedback": f"SQL 실행 실패: {error}. SQL 쿼리를 수정해주세요.",
@@ -229,7 +241,7 @@ def execute_sql_node(state):
         }
 
 def verify_results(state):
-    st.write("🔄 결과 검증 중...")
+    update_progress("verify_results", "🔄 결과 검증 중...")
     
     # 재시도 횟수 가져오기
     retry_count = state.get("retry_count", 0)
@@ -260,24 +272,21 @@ def verify_results(state):
         verification_passed = "예" in verification_text[:100] and "아니오" not in verification_text[:100]
         
         if verification_passed:
-            st.write("✅ 결과 검증 성공")
-            return {"verification_passed": True, "verification_message": response.content, "retry_count": retry_count}
+            update_progress("verify_results", "✅ 결과 검증 성공")
+            return {"verification_passed": True, "verification_message": response.content}
         else:
-            st.write(f"❌ 결과 검증 실패: {response.content[:100]}...")
+            update_progress("verify_results", f"❌ 결과 검증 실패: {response.content[:100]}...")
             return {
                 "verification_passed": False,
                 "error_feedback": f"결과 검증 실패: {response.content}. 더 나은 SQL 쿼리를 생성해주세요.",
                 "retry_count": retry_count + 1
             }
     except Exception as e:
-        st.write(f"❌ 결과 검증 오류: {str(e)}")
+        update_progress("verify_results", f"❌ 결과 검증 오류: {str(e)}")
         return {"verification_passed": False, "error_feedback": f"결과 검증 중 오류 발생: {str(e)}", "retry_count": retry_count + 1}
 
 def generate_insights(state):
-    st.write("🔄 인사이트 생성 중...")
-    
-    # 재시도 횟수 가져오기
-    retry_count = state.get("retry_count", 0)
+    update_progress("generate_insights", "🔄 인사이트 생성 중...")
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", """당신은 데이터에서 인사이트를 찾는 데이터 분석 전문가입니다.
@@ -301,11 +310,11 @@ def generate_insights(state):
             "results": json.dumps(state["results"], default=str)
         })
         
-        st.write("✅ 인사이트 생성 완료")
-        return {"insights": response.content, "retry_count": retry_count}
+        update_progress("generate_insights", "✅ 인사이트 생성 완료")
+        return {"insights": response.content}
     except Exception as e:
-        st.write(f"❌ 인사이트 생성 오류: {str(e)}")
-        return {"insights": f"인사이트 생성 중 오류가 발생했습니다: {str(e)}", "retry_count": retry_count}
+        update_progress("generate_insights", f"❌ 인사이트 생성 오류: {str(e)}")
+        return {"insights": f"인사이트 생성 중 오류가 발생했습니다: {str(e)}"}
 
 # LangGraph 구축
 def build_graph():
@@ -392,33 +401,42 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
     
     # 처리 중 표시
     with st.chat_message("assistant"):
-        with st.spinner("요청을 분석 중입니다..."):
-            try:
-                # 그래프 구축 및 실행
+        # 진행 상황 표시 영역 생성
+        st.session_state.progress_placeholder = st.empty()
+        
+        try:
+            # 진행 상황 표시
+            with st.session_state.progress_placeholder:
                 st.write("🚀 워크플로우 시작")
-                graph = build_graph()
-                result = graph.invoke({
-                    "user_request": prompt,
-                    "retry_count": 0  # 초기 재시도 횟수 설정
-                })
+            
+            # 그래프 구축
+            graph = build_graph()
+            
+            # 그래프 실행
+            result = graph.invoke({
+                "user_request": prompt,
+                "retry_count": 0  # 초기 재시도 횟수 설정
+            })
+            
+            with st.session_state.progress_placeholder:
                 st.write("✅ 워크플로우 완료")
-                
-                # SQL 표시
-                st.subheader("SQL 쿼리")
-                st.code(result["sql"], language="sql")
-                
-                # 결과를 테이블로 표시 (가능한 경우)
-                if "results" in result and result["results"]:
-                    st.subheader("쿼리 결과")
-                    df = pd.DataFrame(result["results"])
-                    st.dataframe(df)
-                
-                # 인사이트 표시
-                st.subheader("인사이트")
-                st.markdown(result["insights"])
-                
-                # 전체 응답을 채팅 기록에 저장
-                full_response = f"""**SQL 쿼리:**
+            
+            # SQL 표시
+            st.subheader("SQL 쿼리")
+            st.code(result["sql"], language="sql")
+            
+            # 결과를 테이블로 표시 (가능한 경우)
+            if "results" in result and result["results"]:
+                st.subheader("쿼리 결과")
+                df = pd.DataFrame(result["results"])
+                st.dataframe(df)
+            
+            # 인사이트 표시
+            st.subheader("인사이트")
+            st.markdown(result["insights"])
+            
+            # 전체 응답을 채팅 기록에 저장
+            full_response = f"""**SQL 쿼리:**
 ```sql
 {result["sql"]}
 ```
@@ -426,18 +444,18 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
 **인사이트:**
 {result["insights"]}
 """
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                
-                # 디버그 정보 저장
-                st.session_state.current_state = result
-                
-            except Exception as e:
-                st.error(f"오류 발생: {str(e)}")
-                st.write("디버그 정보:")
-                st.write(f"오류 유형: {type(e).__name__}")
-                st.write(f"오류 메시지: {str(e)}")
-                import traceback
-                st.code(traceback.format_exc(), language="python")
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            
+            # 디버그 정보 저장
+            st.session_state.current_state = result
+            
+        except Exception as e:
+            st.error(f"오류 발생: {str(e)}")
+            st.write("디버그 정보:")
+            st.write(f"오류 유형: {type(e).__name__}")
+            st.write(f"오류 메시지: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc(), language="python")
 
 # 사이드바에 정보 추가
 with st.sidebar:
