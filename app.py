@@ -155,9 +155,20 @@ def generate_sql(state):
     retry_count = state.get("retry_count", 0)
     if retry_count >= 3:
         update_progress("generate_sql", "⚠️ 최대 재시도 횟수 초과. 프로세스를 중단합니다.")
-        return {"sql": "-- 최대 재시도 횟수 초과", "error_source": "generate_sql"}
+        return {"sql": "-- 최대 재시도 횟수 초과", "sql_error": "최대 재시도 횟수를 초과했습니다."}
     
     schema = get_table_schema()
+    
+    # 이전 오류 메시지 수집
+    error_feedback = ""
+    if state.get("sql_error"):
+        error_feedback += state.get("sql_error", "") + "\n"
+    if state.get("validation_error"):
+        error_feedback += state.get("validation_error", "") + "\n"
+    if state.get("execution_error"):
+        error_feedback += state.get("execution_error", "") + "\n"
+    if state.get("verification_error"):
+        error_feedback += state.get("verification_error", "") + "\n"
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", """당신은 Amazon Redshift SQL 전문가입니다.
@@ -175,7 +186,6 @@ def generate_sql(state):
         이 요청에 대한 SQL 쿼리를 생성하세요.""")
     ])
     
-    error_feedback = state.get("error_feedback", "")
     if error_feedback:
         update_progress("generate_sql", f"⚠️ 이전 오류: {error_feedback}")
     
@@ -193,11 +203,17 @@ def generate_sql(state):
             sql = sql.replace("```sql", "").replace("```", "").strip()
         
         update_progress("generate_sql", "✅ SQL 생성 완료", sql)
-        return {"sql": sql, "error_feedback": "", "error_source": ""}
+        return {
+            "sql": sql, 
+            "sql_error": "", 
+            "validation_error": "", 
+            "execution_error": "", 
+            "verification_error": ""
+        }
     except Exception as e:
         error_msg = f"SQL 생성 중 오류 발생: {str(e)}"
         update_progress("generate_sql", f"❌ SQL 생성 오류: {str(e)}")
-        return {"sql": "", "error_feedback": error_msg, "retry_count": retry_count + 1, "error_source": "generate_sql"}
+        return {"sql": "", "sql_error": error_msg, "retry_count": retry_count + 1}
 
 def validate_sql_node(state):
     update_progress("validate_sql", "🔄 SQL 검증 중...")
@@ -210,15 +226,14 @@ def validate_sql_node(state):
     
     if is_valid:
         update_progress("validate_sql", "✅ SQL 검증 성공")
-        return {"is_valid": True, "error_feedback": "", "error_source": ""}
+        return {"is_valid": True, "validation_error": ""}
     else:
         error_msg = f"SQL 검증 실패: {error_message}. SQL 쿼리를 수정해주세요."
         update_progress("validate_sql", f"❌ SQL 검증 실패: {error_message}")
         return {
             "is_valid": False,
-            "error_feedback": error_msg,
-            "retry_count": retry_count + 1,
-            "error_source": "validate_sql"
+            "validation_error": error_msg,
+            "retry_count": retry_count + 1
         }
 
 def execute_sql_node(state):
@@ -234,15 +249,14 @@ def execute_sql_node(state):
         # DataFrame을 JSON 직렬화를 위해 딕셔너리로 변환
         results = df.to_dict(orient="records")
         update_progress("execute_sql", f"✅ SQL 실행 성공: {len(results)}개의 결과 반환")
-        return {"results": results, "execution_successful": True, "error_feedback": "", "error_source": ""}
+        return {"results": results, "execution_successful": True, "execution_error": ""}
     else:
         error_msg = f"SQL 실행 실패: {error}. SQL 쿼리를 수정해주세요."
         update_progress("execute_sql", f"❌ SQL 실행 실패: {error}")
         return {
             "execution_successful": False,
-            "error_feedback": error_msg,
-            "retry_count": retry_count + 1,
-            "error_source": "execute_sql"
+            "execution_error": error_msg,
+            "retry_count": retry_count + 1
         }
 
 def verify_results(state):
@@ -278,25 +292,23 @@ def verify_results(state):
         
         if verification_passed:
             update_progress("verify_results", "✅ 결과 검증 성공")
-            return {"verification_passed": True, "verification_message": response.content, "error_feedback": "", "error_source": ""}
+            return {"verification_passed": True, "verification_message": response.content, "verification_error": ""}
         else:
             # 전체 응답 내용을 표시하도록 수정
             update_progress("verify_results", f"❌ 결과 검증 실패: {response.content}")
             error_msg = f"결과 검증 실패: {response.content}. 더 나은 SQL 쿼리를 생성해주세요."
             return {
                 "verification_passed": False,
-                "error_feedback": error_msg,
-                "retry_count": retry_count + 1,
-                "error_source": "verify_results"
+                "verification_error": error_msg,
+                "retry_count": retry_count + 1
             }
     except Exception as e:
         error_msg = f"결과 검증 중 오류 발생: {str(e)}"
         update_progress("verify_results", f"❌ 결과 검증 오류: {str(e)}")
         return {
             "verification_passed": False, 
-            "error_feedback": error_msg, 
-            "retry_count": retry_count + 1,
-            "error_source": "verify_results"
+            "verification_error": error_msg, 
+            "retry_count": retry_count + 1
         }
 
 def generate_insights(state):
@@ -325,11 +337,11 @@ def generate_insights(state):
         })
         
         update_progress("generate_insights", "✅ 인사이트 생성 완료")
-        return {"insights": response.content, "error_feedback": "", "error_source": ""}
+        return {"insights": response.content, "insights_error": ""}
     except Exception as e:
         error_msg = f"인사이트 생성 중 오류가 발생했습니다: {str(e)}"
         update_progress("generate_insights", f"❌ 인사이트 생성 오류: {str(e)}")
-        return {"insights": error_msg, "error_source": "generate_insights"}
+        return {"insights": error_msg, "insights_error": error_msg}
 
 # LangGraph 구축
 def build_graph():
@@ -342,9 +354,13 @@ def build_graph():
         execution_successful: Optional[bool]
         verification_passed: Optional[bool]
         insights: Optional[str]
-        error_feedback: Optional[str]
         retry_count: Optional[int]  # 재시도 횟수 추적
-        error_source: Optional[str]  # 오류 발생 소스 추적
+        # 각 노드별 오류 메시지
+        sql_error: Optional[str]
+        validation_error: Optional[str]
+        execution_error: Optional[str]
+        verification_error: Optional[str]
+        insights_error: Optional[str]
     
     # 그래프 생성
     workflow = StateGraph(GraphState)
