@@ -26,12 +26,18 @@ if "progress_placeholder" not in st.session_state:
     st.session_state.progress_placeholder = None
 if "current_step" not in st.session_state:
     st.session_state.current_step = ""
+if "progress_logs" not in st.session_state:
+    st.session_state.progress_logs = []
 
-# 진행 상황 업데이트 함수
+# 진행 상황 업데이트 함수 - 직접 화면에 표시
 def update_progress(step: str, message: str, code: str = None):
-    if "progress_placeholder" in st.session_state and st.session_state.progress_placeholder:
-        with st.session_state.progress_placeholder:
-            st.write(f"{message}")
+    # 로그에 메시지 추가
+    st.session_state.progress_logs.append(f"{message}")
+    
+    # 직접 화면에 표시
+    if "progress_container" in st.session_state and st.session_state.progress_container:
+        with st.session_state.progress_container:
+            st.write(message)
             if code:
                 st.code(code, language="sql")# Bedrock 클라이언트 초기화 (Claude 3.7)
 bedrock_client = boto3.client(
@@ -152,8 +158,8 @@ def generate_sql(state):
     update_progress("generate_sql", "🔄 SQL 생성 중...")
     
     # 재시도 횟수 추적
-    retry_count = state.get("retry_count", 0)
-    if retry_count >= 3:
+    sql_retry_count = state.get("sql_retry_count", 0)
+    if sql_retry_count >= 3:
         update_progress("generate_sql", "⚠️ 최대 재시도 횟수 초과. 프로세스를 중단합니다.")
         return {"sql": "-- 최대 재시도 횟수 초과", "sql_error": "최대 재시도 횟수를 초과했습니다."}
     
@@ -208,19 +214,26 @@ def generate_sql(state):
             "sql_error": "", 
             "validation_error": "", 
             "execution_error": "", 
-            "verification_error": ""
+            "verification_error": "",
+            "sql_retry_count": 0,
+            "validation_retry_count": 0,
+            "execution_retry_count": 0,
+            "verification_retry_count": 0
         }
     except Exception as e:
         error_msg = f"SQL 생성 중 오류 발생: {str(e)}"
         update_progress("generate_sql", f"❌ SQL 생성 오류: {str(e)}")
-        return {"sql": "", "sql_error": error_msg, "retry_count": retry_count + 1}
+        return {"sql": "", "sql_error": error_msg, "sql_retry_count": sql_retry_count + 1}
 
 def validate_sql_node(state):
     update_progress("validate_sql", "🔄 SQL 검증 중...")
     sql = state["sql"]
     
     # 재시도 횟수 가져오기
-    retry_count = state.get("retry_count", 0)
+    validation_retry_count = state.get("validation_retry_count", 0)
+    if validation_retry_count >= 3:
+        update_progress("validate_sql", "⚠️ 검증 최대 재시도 횟수 초과.")
+        return {"is_valid": False, "validation_error": "검증 최대 재시도 횟수를 초과했습니다."}
     
     is_valid, error_message = validate_sql(sql)
     
@@ -233,7 +246,7 @@ def validate_sql_node(state):
         return {
             "is_valid": False,
             "validation_error": error_msg,
-            "retry_count": retry_count + 1
+            "validation_retry_count": validation_retry_count + 1
         }
 
 def execute_sql_node(state):
@@ -241,7 +254,10 @@ def execute_sql_node(state):
     sql = state["sql"]
     
     # 재시도 횟수 가져오기
-    retry_count = state.get("retry_count", 0)
+    execution_retry_count = state.get("execution_retry_count", 0)
+    if execution_retry_count >= 3:
+        update_progress("execute_sql", "⚠️ 실행 최대 재시도 횟수 초과.")
+        return {"execution_successful": False, "execution_error": "실행 최대 재시도 횟수를 초과했습니다."}
     
     df, error = execute_sql(sql)
     
@@ -256,14 +272,17 @@ def execute_sql_node(state):
         return {
             "execution_successful": False,
             "execution_error": error_msg,
-            "retry_count": retry_count + 1
+            "execution_retry_count": execution_retry_count + 1
         }
 
 def verify_results(state):
     update_progress("verify_results", "🔄 결과 검증 중...")
     
     # 재시도 횟수 가져오기
-    retry_count = state.get("retry_count", 0)
+    verification_retry_count = state.get("verification_retry_count", 0)
+    if verification_retry_count >= 3:
+        update_progress("verify_results", "⚠️ 검증 최대 재시도 횟수 초과.")
+        return {"verification_passed": False, "verification_error": "검증 최대 재시도 횟수를 초과했습니다."}
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", """당신은 데이터 분석 전문가입니다.
@@ -300,7 +319,7 @@ def verify_results(state):
             return {
                 "verification_passed": False,
                 "verification_error": error_msg,
-                "retry_count": retry_count + 1
+                "verification_retry_count": verification_retry_count + 1
             }
     except Exception as e:
         error_msg = f"결과 검증 중 오류 발생: {str(e)}"
@@ -308,7 +327,7 @@ def verify_results(state):
         return {
             "verification_passed": False, 
             "verification_error": error_msg, 
-            "retry_count": retry_count + 1
+            "verification_retry_count": verification_retry_count + 1
         }
 
 def generate_insights(state):
@@ -354,13 +373,17 @@ def build_graph():
         execution_successful: Optional[bool]
         verification_passed: Optional[bool]
         insights: Optional[str]
-        retry_count: Optional[int]  # 재시도 횟수 추적
         # 각 노드별 오류 메시지
         sql_error: Optional[str]
         validation_error: Optional[str]
         execution_error: Optional[str]
         verification_error: Optional[str]
         insights_error: Optional[str]
+        # 각 노드별 재시도 카운터
+        sql_retry_count: Optional[int]
+        validation_retry_count: Optional[int]
+        execution_retry_count: Optional[int]
+        verification_retry_count: Optional[int]
     
     # 그래프 생성
     workflow = StateGraph(GraphState)
@@ -431,27 +454,38 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
     with st.chat_message("user"):
         st.markdown(prompt)
     
+    # 로그 초기화
+    st.session_state.progress_logs = []
+    
     # 처리 중 표시
     with st.chat_message("assistant"):
-        # 진행 상황 표시 영역 생성
-        st.session_state.progress_placeholder = st.empty()
+        # 진행 상황 표시 영역 생성 - 전역 변수로 설정하여 모든 함수에서 접근 가능하게 함
+        st.session_state.progress_container = st.container()
+        
+        # 초기 메시지 표시
+        update_progress("start", "🚀 워크플로우 시작")
         
         try:
-            # 진행 상황 표시
-            with st.session_state.progress_placeholder:
-                st.write("🚀 워크플로우 시작")
-            
             # 그래프 구축
             graph = build_graph()
             
             # 그래프 실행
             result = graph.invoke({
                 "user_request": prompt,
-                "retry_count": 0  # 초기 재시도 횟수 설정
+                # 각 노드별 재시도 카운터 초기화
+                "sql_retry_count": 0,
+                "validation_retry_count": 0,
+                "execution_retry_count": 0,
+                "verification_retry_count": 0,
+                # 각 노드별 오류 메시지 초기화
+                "sql_error": "",
+                "validation_error": "",
+                "execution_error": "",
+                "verification_error": "",
+                "insights_error": ""
             })
             
-            with st.session_state.progress_placeholder:
-                st.write("✅ 워크플로우 완료")
+            update_progress("end", "✅ 워크플로우 완료")
             
             # SQL 표시
             st.subheader("SQL 쿼리")
@@ -482,6 +516,9 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
             st.session_state.current_state = result
             
         except Exception as e:
+            # 오류 발생 시 로그 업데이트
+            update_progress("error", f"❌ 오류 발생: {str(e)}")
+            
             st.error(f"오류 발생: {str(e)}")
             st.write("디버그 정보:")
             st.write(f"오류 유형: {type(e).__name__}")
@@ -501,3 +538,8 @@ with st.sidebar:
         st.write("현재 상태:")
         if "current_state" in st.session_state:
             st.json(st.session_state.current_state)
+        
+        st.write("진행 로그:")
+        if "progress_logs" in st.session_state:
+            for i, log in enumerate(st.session_state.progress_logs):
+                st.write(f"{i+1}. {log}")
