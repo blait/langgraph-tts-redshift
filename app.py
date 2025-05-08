@@ -9,10 +9,17 @@ from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Optional, List, Dict, Any, Callable
 import json
 import os
+import threading
+import time
 from dotenv import load_dotenv
 
 # 환경 변수 로드
 load_dotenv()
+
+# 전역 변수로 로그 관리
+global_logs = []
+displayed_logs = set()  # 이미 표시된 로그를 추적
+log_lock = threading.Lock()  # 스레드 안전을 위한 락
 
 # Redshift 연결 파라미터
 redshift_host = os.getenv("REDSHIFT_HOST")
@@ -21,25 +28,22 @@ redshift_dbname = os.getenv("REDSHIFT_DBNAME")
 redshift_user = os.getenv("REDSHIFT_USER")
 redshift_password = os.getenv("REDSHIFT_PASSWORD")
 
-# Streamlit 상태 초기화
-if "progress_placeholder" not in st.session_state:
-    st.session_state.progress_placeholder = None
-if "current_step" not in st.session_state:
-    st.session_state.current_step = ""
-if "progress_logs" not in st.session_state:
-    st.session_state.progress_logs = []
-
-# 진행 상황 업데이트 함수 - 직접 화면에 표시
+# 진행 상황 업데이트 함수 - 전역 변수 사용
 def update_progress(step: str, message: str, code: str = None):
-    # 로그에 메시지 추가
-    st.session_state.progress_logs.append(f"{message}")
-    
-    # 직접 화면에 표시
-    if "progress_container" in st.session_state and st.session_state.progress_container:
-        with st.session_state.progress_container:
-            st.write(message)
+    with log_lock:
+        log_entry = f"{message}"
+        
+        # 중복 체크 후 새로운 로그만 추가
+        if log_entry not in displayed_logs:
+            global_logs.append(log_entry)
+            displayed_logs.add(log_entry)
+            
+            # SQL 코드가 있으면 추가
             if code:
-                st.code(code, language="sql")# Bedrock 클라이언트 초기화 (Claude 3.7)
+                code_entry = f"SQL: {code}"
+                if code_entry not in displayed_logs:
+                    global_logs.append(code_entry)
+                    displayed_logs.add(code_entry)# Bedrock 클라이언트 초기화 (Claude 3.7)
 bedrock_client = boto3.client(
     service_name="bedrock-runtime",
     region_name=os.getenv("AWS_REGION", "us-west-2")
@@ -454,16 +458,48 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # 로그 초기화
-    st.session_state.progress_logs = []
+    # 전역 로그 초기화
+    global global_logs, displayed_logs
+    global_logs = []
+    displayed_logs = set()
     
     # 처리 중 표시
     with st.chat_message("assistant"):
-        # 진행 상황 표시 영역 생성 - 전역 변수로 설정하여 모든 함수에서 접근 가능하게 함
-        st.session_state.progress_container = st.container()
+        # 진행 상황 표시 영역 생성
+        progress_container = st.container()
+        
+        # 로그 표시 함수
+        def display_logs():
+            with progress_container:
+                # 기존 내용 지우기 위해 빈 컨테이너 생성
+                progress_container.empty()
+                # 로그 표시
+                for log in global_logs:
+                    if log.startswith("SQL:"):
+                        # SQL 코드 블록 처리
+                        code = log.replace("SQL:", "").strip()
+                        st.code(code, language="sql")
+                    else:
+                        st.write(log)
         
         # 초기 메시지 표시
         update_progress("start", "🚀 워크플로우 시작")
+        display_logs()
+        
+        # 로그 업데이트 스레드
+        def update_log_display():
+            last_log_count = 0
+            while True:
+                with log_lock:
+                    if len(global_logs) > last_log_count:
+                        display_logs()
+                        last_log_count = len(global_logs)
+                time.sleep(0.1)  # 0.1초마다 로그 확인
+        
+        # 로그 업데이트 스레드 시작
+        log_thread = threading.Thread(target=update_log_display)
+        log_thread.daemon = True
+        log_thread.start()
         
         try:
             # 그래프 구축
@@ -486,6 +522,7 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
             })
             
             update_progress("end", "✅ 워크플로우 완료")
+            display_logs()
             
             # SQL 표시
             st.subheader("SQL 쿼리")
@@ -518,6 +555,7 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
         except Exception as e:
             # 오류 발생 시 로그 업데이트
             update_progress("error", f"❌ 오류 발생: {str(e)}")
+            display_logs()
             
             st.error(f"오류 발생: {str(e)}")
             st.write("디버그 정보:")
@@ -540,6 +578,6 @@ with st.sidebar:
             st.json(st.session_state.current_state)
         
         st.write("진행 로그:")
-        if "progress_logs" in st.session_state:
-            for i, log in enumerate(st.session_state.progress_logs):
+        with log_lock:
+            for i, log in enumerate(global_logs):
                 st.write(f"{i+1}. {log}")
