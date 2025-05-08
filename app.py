@@ -152,10 +152,18 @@ class GraphState(TypedDict):
     insights: Optional[str]
     error_feedback: Optional[str]
     status: Optional[str]
+    retry_count: Optional[int]
 
 # LangGraph 노드
 def generate_sql(state: GraphState) -> GraphState:
-    logger.info("generate_sql 노드 실행")
+    # 현재 상태 로깅
+    retry_count = state.get("retry_count", 0)
+    error_feedback = state.get("error_feedback", "")
+    
+    logger.info(f"generate_sql 노드 실행 (재시도: {retry_count})")
+    if error_feedback:
+        logger.info(f"피드백 정보: {error_feedback[:200]}...")
+    
     schema = get_table_schema()
     
     prompt = ChatPromptTemplate.from_messages([
@@ -163,7 +171,9 @@ def generate_sql(state: GraphState) -> GraphState:
         자연어 쿼리를 정확한 SQL 쿼리로 변환하는 것이 당신의 임무입니다.
         제공된 스키마 정보를 사용하여 정확한 SQL을 작성하세요.
         설명이나 마크다운 형식 없이 SQL 쿼리만 반환하세요.
-        Redshift에 최적화된 SQL을 작성하세요."""),
+        Redshift에 최적화된 SQL을 작성하세요.
+        
+        이전 쿼리에 문제가 있었다면, 그 피드백을 참고하여 개선된 쿼리를 작성하세요."""),
         ("user", """스키마 정보:
         {schema}
         
@@ -191,8 +201,6 @@ def generate_sql(state: GraphState) -> GraphState:
    - 출력: 정수.""")
     ])
     
-    error_feedback = state.get("error_feedback", "")
-    
     chain = prompt | llm
     response = chain.invoke({
         "schema": schema,
@@ -204,46 +212,75 @@ def generate_sql(state: GraphState) -> GraphState:
     if sql.startswith("```sql"):
         sql = sql.replace("```sql", "").replace("```", "").strip()
     
-    logger.info(f"SQL 생성됨: {sql[:100]}...")
-    return {"sql": sql, "status": "sql_generated"}
+    # 재시도 횟수 증가
+    new_retry_count = retry_count + 1
+    
+    logger.info(f"SQL 생성됨 (재시도 {new_retry_count}번째): {sql[:100]}...")
+    return {
+        "sql": sql, 
+        "status": "sql_generated",
+        "retry_count": new_retry_count,
+        "user_request": state["user_request"]  # 사용자 요청 유지
+    }
 
 def validate_sql_node(state: GraphState) -> GraphState:
-    logger.info("validate_sql_node 노드 실행")
+    logger.info(f"validate_sql_node 노드 실행 (재시도: {state.get('retry_count', 0)})")
     sql = state["sql"]
     is_valid, error_message = validate_sql(sql)
     
     logger.info(f"SQL 검증 결과: {is_valid}")
     
     if is_valid:
-        return {"is_valid": True, "status": "sql_validated", "sql": sql}
+        return {
+            "is_valid": True, 
+            "status": "sql_validated", 
+            "sql": sql,
+            "user_request": state["user_request"],
+            "retry_count": state.get("retry_count", 0)
+        }
     else:
         return {
             "is_valid": False,
             "error_feedback": f"SQL 검증 실패: {error_message}. SQL 쿼리를 수정해주세요.",
             "status": "sql_invalid",
-            "sql": sql
+            "sql": sql,
+            "user_request": state["user_request"],
+            "retry_count": state.get("retry_count", 0)
         }
 
 def execute_sql_node(state: GraphState) -> GraphState:
-    logger.info("execute_sql_node 노드 실행")
+    logger.info(f"execute_sql_node 노드 실행 (재시도: {state.get('retry_count', 0)})")
     sql = state["sql"]
     df, error = execute_sql(sql)
+    
+    # 기본 상태 유지를 위한 딕셔너리
+    result = {
+        "sql": sql,
+        "user_request": state["user_request"],
+        "retry_count": state.get("retry_count", 0),
+        "is_valid": state.get("is_valid", False)
+    }
     
     if df is not None:
         results = df.to_dict(orient="records")
         logger.info(f"SQL 실행 성공: {len(results)} 행 반환됨")
-        return {"results": results, "execution_successful": True, "status": "sql_executed", "sql": sql}
+        result.update({
+            "results": results, 
+            "execution_successful": True, 
+            "status": "sql_executed"
+        })
+        return result
     else:
         logger.error(f"SQL 실행 실패: {error}")
-        return {
+        result.update({
             "execution_successful": False,
             "error_feedback": f"SQL 실행 실패: {error}. SQL 쿼리를 수정해주세요.",
-            "status": "execution_failed",
-            "sql": sql
-        }
+            "status": "execution_failed"
+        })
+        return result
 
 def verify_results(state: GraphState) -> GraphState:
-    logger.info("verify_results 노드 실행")
+    logger.info(f"verify_results 노드 실행 (재시도: {state.get('retry_count', 0)})")
     prompt = ChatPromptTemplate.from_messages([
         ("system", """당신은 데이터 분석 전문가입니다.
         SQL 쿼리 결과가 사용자의 원래 요청을 제대로 해결하는지 확인하는 것이 당신의 임무입니다.
@@ -271,30 +308,41 @@ def verify_results(state: GraphState) -> GraphState:
     verification_passed = verification_text.startswith("VERIFIED:")
     
     logger.info(f"검증 결과: {'통과' if verification_passed else '실패'}")
-    logger.info(f"검증 메시지: {verification_text[:100]}...")
+    logger.info(f"검증 메시지: {verification_text[:200]}...")
+    
+    # 기본 상태 유지를 위한 딕셔너리
+    result = {
+        "sql": state["sql"],
+        "user_request": state["user_request"],
+        "results": state["results"],
+        "retry_count": state.get("retry_count", 0),
+        "is_valid": state.get("is_valid", False),
+        "execution_successful": state.get("execution_successful", False)
+    }
     
     if verification_passed:
-        return {
+        result.update({
             "verification_passed": True,
             "verification_message": verification_text,
-            "status": "results_verified",
-            "sql": state["sql"]
-        }
+            "status": "results_verified"
+        })
+        return result
     else:
-        return {
+        result.update({
             "verification_passed": False,
             "error_feedback": f"결과 검증 실패: {verification_text}. 더 나은 SQL 쿼리를 생성해주세요.",
-            "status": "results_not_verified",
-            "sql": state["sql"]
-        }
+            "status": "results_not_verified"
+        })
+        return result
 
 def generate_insights(state: GraphState) -> GraphState:
-    logger.info("generate_insights 노드 실행")
+    logger.info(f"generate_insights 노드 실행 (재시도: {state.get('retry_count', 0)})")
     prompt = ChatPromptTemplate.from_messages([
         ("system", """당신은 데이터에서 인사이트를 찾는 데이터 분석 전문가입니다.
         제공된 SQL 쿼리 결과를 분석하고 사용자 요청과 관련된 의미 있는 인사이트를 제공하세요.
-        관련 통계, 추세, 이상치 및 실행 가능한 권장 사항을 포함하세요.
-        섹션과 글머리 기호를 사용하여 명확하고 구조화된 방식으로 응답을 포맷하세요."""),
+        관련 통계, 추세, 이상치, 그래프 및 실행 가능한 권장 사항을 포함하세요.
+        섹션과 글머리 기호를 사용하여 명확하고 구조화된 방식으로 응답을 포맷하세요.
+         가능하다면 시각화 가능한 형태로 그래프를 뽑아주세요"""),
         ("user", """사용자 요청: {user_request}
         
         SQL 쿼리: {sql}
@@ -312,21 +360,68 @@ def generate_insights(state: GraphState) -> GraphState:
     })
     
     logger.info("인사이트 생성 완료")
-    return {"insights": response.content, "status": "insights_generated", "sql": state["sql"]}
+    
+    # 이전 상태의 모든 정보 유지
+    result = {
+        **state,
+        "insights": response.content,
+        "status": "insights_generated"
+    }
+    
+    return result
 
 # 라우팅 함수
-def route_validation(state: GraphState) -> Literal["valid", "invalid"]:
-    logger.info(f"검증 라우팅: {state.get('is_valid', False)}")
-    return "valid" if state.get("is_valid", False) else "invalid"
+def route_validation(state: GraphState) -> str:
+    is_valid = state.get("is_valid", False)
+    logger.info(f"검증 라우팅: is_valid={is_valid}, 결정={('valid' if is_valid else 'invalid')}")
+    
+    # 검증 실패 시 SQL 로그
+    if not is_valid:
+        logger.info(f"검증 실패한 SQL: {state.get('sql', '없음')}")
+        logger.info(f"오류 피드백: {state.get('error_feedback', '없음')}")
+        logger.info(f"재시도 횟수: {state.get('retry_count', 0)}")
+    
+    # 최대 재시도 횟수 체크
+    if not is_valid and state.get("retry_count", 0) >= 5:
+        logger.warning("최대 재시도 횟수 도달, 검증 실패에도 불구하고 진행합니다.")
+        return "valid"  # 강제 진행
+    
+    return "valid" if is_valid else "invalid"
 
-def route_execution(state: GraphState) -> Literal["success", "failure"]:
-    logger.info(f"실행 라우팅: {state.get('execution_successful', False)}")
-    return "success" if state.get("execution_successful", False) else "failure"
+def route_execution(state: GraphState) -> str:
+    is_successful = state.get("execution_successful", False)
+    logger.info(f"실행 라우팅: execution_successful={is_successful}, 결정={('success' if is_successful else 'failure')}")
+    
+    # 실행 실패 시 SQL 로그
+    if not is_successful:
+        logger.info(f"실행 실패한 SQL: {state.get('sql', '없음')}")
+        logger.info(f"오류 피드백: {state.get('error_feedback', '없음')}")
+        logger.info(f"재시도 횟수: {state.get('retry_count', 0)}")
+    
+    # 최대 재시도 횟수 체크
+    if not is_successful and state.get("retry_count", 0) >= 5:
+        logger.warning("최대 재시도 횟수 도달, 실행 실패에도 불구하고 진행합니다.")
+        return "success"  # 강제 진행
+    
+    return "success" if is_successful else "failure"
 
-def route_verification(state: GraphState) -> Literal["verified", "not_verified"]:
-    logger.info(f"검증 라우팅: {state.get('verification_passed', False)}")
-    logger.info(f"상태: {state.get('status', '')}")
-    return "verified" if state.get("verification_passed", False) else "not_verified"
+def route_verification(state: GraphState) -> str:
+    is_verified = state.get("verification_passed", False)
+    logger.info(f"검증 라우팅: verification_passed={is_verified}, 결정={('verified' if is_verified else 'not_verified')}")
+    
+    # 검증 실패 시 상세 로그
+    if not is_verified:
+        logger.info(f"검증 실패한 SQL: {state.get('sql', '없음')}")
+        logger.info(f"검증 메시지: {state.get('verification_message', '없음')}")
+        logger.info(f"오류 피드백: {state.get('error_feedback', '없음')}")
+        logger.info(f"재시도 횟수: {state.get('retry_count', 0)}")
+    
+    # 최대 재시도 횟수 체크
+    if not is_verified and state.get("retry_count", 0) >= 5:
+        logger.warning("최대 재시도 횟수 도달, 검증 실패에도 불구하고 진행합니다.")
+        return "verified"  # 강제 진행
+    
+    return "verified" if is_verified else "not_verified"
 
 # LangGraph 구축
 def build_graph():
@@ -338,15 +433,18 @@ def build_graph():
     workflow.add_node("verify_results", verify_results)
     workflow.add_node("generate_insights", generate_insights)
     
-    workflow.add_edge(START, "generate_sql")
+    # 시작점 설정
+    workflow.set_entry_point("generate_sql")
     
+    # 조건부 엣지 설정 - 모든 엣지에 merge=True 추가
     workflow.add_conditional_edges(
         "validate_sql",
         route_validation,
         {
             "valid": "execute_sql",
             "invalid": "generate_sql" 
-        }
+        },
+        merge=True
     )
     
     workflow.add_conditional_edges(
@@ -355,18 +453,21 @@ def build_graph():
         {
             "success": "verify_results",
             "failure": "generate_sql"
-        }
+        },
+        merge=True
     )
     
     workflow.add_conditional_edges(
         "verify_results",
-       route_verification,
+        route_verification,
         {
             "verified": "generate_insights",
             "not_verified": "generate_sql"
-        }
+        },
+        merge=True
     )
     
+    # 종료점 설정
     workflow.add_edge("generate_insights", END)
     
     logger.info("그래프 컴파일됨")
@@ -380,6 +481,9 @@ debug_mode = st.sidebar.checkbox("디버그 모드", value=True)
 
 # 개발 모드 설정 - 노드 직접 실행 여부
 dev_mode = st.sidebar.checkbox("개발 모드 (노드 직접 실행)", value=True)
+
+# 최대 재시도 횟수 설정
+max_retries = st.sidebar.slider("최대 재시도 횟수", min_value=1, max_value=10, value=5)
 
 # 타임아웃 설정
 timeout = st.sidebar.slider("타임아웃(초)", min_value=30, max_value=600, value=180)
@@ -414,30 +518,39 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
                     debug_container.json(debug_info)
                 progress_bar.progress(10)
                 
+                # 결과 변수 초기화 - 오류 발생 시 기본값
+                result = {"sql": "", "status": "failed", "retry_count": 0, "user_request": prompt}
+                
                 # 개발 모드에서는 노드를 직접 실행
                 if dev_mode:
                     try:
                         # 초기 상태
-                        current_state = {"user_request": prompt}
+                        current_state = {"user_request": prompt, "retry_count": 0}
                         
-                        # 1. SQL 생성
-                        debug_info["단계"] = "SQL 생성 중"
-                        if debug_mode:
-                            debug_container.json(debug_info)
-                        progress_bar.progress(20)
-                        
-                        sql_state = generate_sql(current_state)
-                        if debug_mode:
-                            debug_container.json({**debug_info, "SQL 생성 결과": sql_state.get("sql", "")[:100] + "..."})
-                        progress_bar.progress(30)
-                        
-                        # SQL 생성 결과 확인
-                        if "sql" not in sql_state:
-                            error_container.error("SQL 생성 실패: SQL이 생성되지 않았습니다.")
+                        # SQL 생성 및 실행 프로세스
+                        for attempt in range(max_retries):
+                            # 1. SQL 생성
+                            debug_info["단계"] = f"SQL 생성 중 (시도 {attempt+1}/{max_retries})"
+                            if debug_mode:
+                                debug_container.json(debug_info)
+                            progress_bar.progress(20)
+                            
+                            sql_state = generate_sql(current_state)
+                            
+                            # 현재 결과 업데이트 - SQL 생성 결과
                             result = sql_state
-                        else:
+                            
+                            if debug_mode:
+                                debug_container.json({**debug_info, "SQL 생성 결과": sql_state.get("sql", "")[:100] + "..."})
+                            progress_bar.progress(30)
+                            
+                            # SQL 생성 결과 확인
+                            if "sql" not in sql_state:
+                                error_container.error("SQL 생성 실패: SQL이 생성되지 않았습니다.")
+                                break  # SQL 생성 자체가 실패하면 종료
+                            
                             # 2. SQL 검증
-                            debug_info["단계"] = "SQL 검증 중"
+                            debug_info["단계"] = f"SQL 검증 중 (시도 {attempt+1}/{max_retries})"
                             if debug_mode:
                                 debug_container.json(debug_info)
                             progress_bar.progress(40)
@@ -447,76 +560,118 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
                             
                             # SQL 검증 함수 호출
                             validation_result = validate_sql_node(validate_state)
+                            
+                            # 현재 결과 업데이트 - 검증 결과
+                            result = validation_result
+                            
                             if debug_mode:
-                                debug_container.json({**debug_info, "검증 결과": validation_result})
+                                debug_container.json({**debug_info, "검증 결과": "성공" if validation_result.get("is_valid", False) else "실패"})
                             progress_bar.progress(50)
                             
-                            # 검증 결과에 따라 다음 단계 결정
-                            if validation_result.get("is_valid", False):
-                                # 3. SQL 실행
-                                debug_info["단계"] = "SQL 실행 중"
-                                if debug_mode:
-                                    debug_container.json(debug_info)
-                                progress_bar.progress(60)
-                                
-                                # 검증 상태와 SQL 상태 병합
-                                execute_state = {**validate_state, **validation_result}
-                                
-                                # SQL 실행 함수 호출
-                                execution_result = execute_sql_node(execute_state)
-                                if debug_mode:
-                                    debug_container.json({**debug_info, "실행 결과": "성공" if execution_result.get("execution_successful", False) else "실패"})
-                                progress_bar.progress(70)
-                                
-                                # 실행 결과에 따라 다음 단계 결정
-                                if execution_result.get("execution_successful", False):
-                                    # 4. 결과 검증
-                                    debug_info["단계"] = "결과 검증 중"
-                                    if debug_mode:
-                                        debug_container.json(debug_info)
-                                    progress_bar.progress(80)
-                                    
-                                    # 실행 상태와 이전 상태 병합
-                                    verify_state = {**execute_state, **execution_result}
-                                    
-                                    # 결과 검증 함수 호출
-                                    verification_result = verify_results(verify_state)
-                                    if debug_mode:
-                                        debug_container.json({**debug_info, "검증 결과": verification_result})
-                                    progress_bar.progress(85)
-                                    
-                                    # 검증 결과에 따라 다음 단계 결정
-                                    if verification_result.get("verification_passed", False):
-                                        # 5. 인사이트 생성
-                                        debug_info["단계"] = "인사이트 생성 중"
-                                        if debug_mode:
-                                            debug_container.json(debug_info)
-                                        progress_bar.progress(90)
-                                        
-                                        # 검증 상태와 이전 상태 병합
-                                        insight_state = {**verify_state, **verification_result}
-                                        
-                                        # 인사이트 생성 함수 호출
-                                        insight_result = generate_insights(insight_state)
-                                        if debug_mode:
-                                            debug_container.json({**debug_info, "인사이트 생성 완료": True})
-                                        progress_bar.progress(100)
-                                        
-                                        # 최종 결과 생성
-                                        result = {**insight_state, **insight_result}
-                                    else:
-                                        # 결과 검증 실패
-                                        error_container.warning("결과 검증 실패: " + verification_result.get("error_feedback", "알 수 없는 오류"))
-                                        result = verification_result
+                            # 검증 실패 시
+                            if not validation_result.get("is_valid", False):
+                                error_container.warning(f"SQL 검증 실패 (시도 {attempt+1}/{max_retries})")
+                                if attempt < max_retries - 1:  # 아직 재시도 가능
+                                    current_state = {
+                                        "user_request": prompt,
+                                        "error_feedback": validation_result.get("error_feedback", ""),
+                                        "retry_count": attempt + 1
+                                    }
+                                    continue  # 다음 시도로
                                 else:
-                                    # SQL 실행 실패
-                                    error_container.error("SQL 실행 실패: " + execution_result.get("error_feedback", "알 수 없는 오류"))
-                                    result = execution_result
-                            else:
-                                # SQL 검증 실패
-                                error_container.error("SQL 검증 실패: " + validation_result.get("error_feedback", "알 수 없는 오류"))
-                                result = validation_result
-                                
+                                    error_container.error("최대 시도 횟수 도달, 마지막 쿼리로 진행합니다.")
+                                    # 강제로 다음 단계 진행
+                                    validation_result["is_valid"] = True
+                            
+                            # 3. SQL 실행
+                            debug_info["단계"] = f"SQL 실행 중 (시도 {attempt+1}/{max_retries})"
+                            if debug_mode:
+                                debug_container.json(debug_info)
+                            progress_bar.progress(60)
+                            
+                            # 검증 상태와 SQL 상태 병합
+                            execute_state = {**validate_state, **validation_result}
+                            
+                            # SQL 실행 함수 호출
+                            execution_result = execute_sql_node(execute_state)
+                            
+                            # 현재 결과 업데이트 - 실행 결과
+                            result = execution_result
+                            
+                            if debug_mode:
+                                debug_container.json({**debug_info, "실행 결과": "성공" if execution_result.get("execution_successful", False) else "실패"})
+                            progress_bar.progress(70)
+                            
+                            # 실행 실패 시
+                            if not execution_result.get("execution_successful", False):
+                                error_container.warning(f"SQL 실행 실패 (시도 {attempt+1}/{max_retries})")
+                                if attempt < max_retries - 1:  # 아직 재시도 가능
+                                    current_state = {
+                                        "user_request": prompt,
+                                        "error_feedback": execution_result.get("error_feedback", ""),
+                                        "retry_count": attempt + 1
+                                    }
+                                    continue  # 다음 시도로
+                                else:
+                                    error_container.error("최대 시도 횟수 도달, 마지막 결과로 진행합니다.")
+                                    break  # 루프 종료
+                            
+                            # 4. 결과 검증
+                            debug_info["단계"] = f"결과 검증 중 (시도 {attempt+1}/{max_retries})"
+                            if debug_mode:
+                                debug_container.json(debug_info)
+                            progress_bar.progress(80)
+                            
+                            # 실행 상태와 이전 상태 병합
+                            verify_state = {**execute_state, **execution_result}
+                            
+                            # 결과 검증 함수 호출
+                            verification_result = verify_results(verify_state)
+                            
+                            # 현재 결과 업데이트 - 검증 결과
+                            result = verification_result
+                            
+                            if debug_mode:
+                                debug_container.json({**debug_info, "검증 결과": "통과" if verification_result.get("verification_passed", False) else "실패"})
+                            progress_bar.progress(85)
+                            
+                            # 검증
+                            # 검증 실패 시
+                            if not verification_result.get("verification_passed", False):
+                                error_container.warning(f"결과 검증 실패 (시도 {attempt+1}/{max_retries})")
+                                if attempt < max_retries - 1:  # 아직 재시도 가능
+                                    current_state = {
+                                        "user_request": prompt,
+                                        "error_feedback": verification_result.get("error_feedback", ""),
+                                        "retry_count": attempt + 1
+                                    }
+                                    continue  # 다음 시도로
+                                else:
+                                    error_container.error("최대 시도 횟수 도달, 마지막 결과로 진행합니다.")
+                                    verification_result["verification_passed"] = True  # 강제 통과
+                            
+                            # 5. 인사이트 생성
+                            debug_info["단계"] = "인사이트 생성 중"
+                            if debug_mode:
+                                debug_container.json(debug_info)
+                            progress_bar.progress(90)
+                            
+                            # 검증 상태와 이전 상태 병합
+                            insight_state = {**verify_state, **verification_result}
+                            
+                            # 인사이트 생성 함수 호출
+                            insight_result = generate_insights(insight_state)
+                            
+                            # 현재 결과 업데이트 - 인사이트 결과
+                            result = insight_result
+                            
+                            if debug_mode:
+                                debug_container.json({**debug_info, "인사이트 생성 완료": True})
+                            progress_bar.progress(100)
+                            
+                            # 성공적으로 완료되면 루프 종료
+                            break
+                        
                     except Exception as node_error:
                         error_container.error(f"노드 실행 중 오류 발생: {str(node_error)}")
                         import traceback
@@ -533,9 +688,9 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
                     # 그래프 구축
                     graph = build_graph()
                     
-                    # 타임아웃 설정
+                    # 타임아웃 및 재시도 설정
                     config = {
-                        "recursion_limit": 25,
+                        "recursion_limit": max_retries * 3,  # 재귀 제한 설정
                         "configurable": {
                             "timeout": timeout
                         }
@@ -546,7 +701,7 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
                     if debug_mode:
                         debug_container.json(debug_info)
                     
-                    result = graph.invoke({"user_request": prompt}, config)
+                    result = graph.invoke({"user_request": prompt, "retry_count": 0}, config)
                     
                     if debug_mode:
                         debug_container.json({**debug_info, "실행 완료": True})
@@ -560,6 +715,7 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
                         "verification_passed": result.get("verification_passed", False),
                         "execution_successful": result.get("execution_successful", False),
                         "is_valid": result.get("is_valid", False),
+                        "retry_count": result.get("retry_count", 0),
                         "keys": list(result.keys())
                     })
                 
@@ -604,6 +760,7 @@ if prompt := st.chat_input("데이터에 대해 질문하세요..."):
 
 **처리 상태:** 
 SQL 쿼리는 생성되었지만, 완전한 분석이 이루어지지 않았습니다.
+재시도 횟수: {result.get("retry_count", 0)}
 """
                         st.session_state.messages.append({"role": "assistant", "content": partial_response})
             
@@ -628,4 +785,6 @@ with st.sidebar:
       2. 디버그 모드를 통해 어느 단계에서 멈추는지 확인하세요.
       3. 타임아웃 값을 늘려 더 긴 처리 시간을 허용하세요.
     - 노드 간 상태 전달 문제가 주로 발생합니다. 각 노드 함수가 모든 필요한 키를 포함하는지 확인하세요.
+    - 재시도 횟수를 조정하여 최대 몇 번까지 재시도할지 설정할 수 있습니다.
+    - 최대 재시도 횟수에 도달하면 강제로 다음 단계로 진행합니다.
     """)
