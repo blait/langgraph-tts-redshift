@@ -13,7 +13,7 @@
 
 1. 사용자 분석 요청 (자연어)
 2. 요청에 대한 Redshift SQL 생성
-3. SQL 검증 (Redshift ANALYZE 활용)
+3. SQL 검증 (Redshift EXPLAIN 활용)
 4. SQL 실행 및 결과 수신
 5. 결과와 SQL로 사용자 요청 충족 여부 검증
 6. 데이터와 SQL 기반으로 분석 인사이트 생성
