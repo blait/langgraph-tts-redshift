@@ -2,6 +2,11 @@
 
 이 프로젝트는 자연어를 사용하여 Amazon Redshift 데이터를 쿼리하고 분석하는 시스템입니다. LangGraph를 사용하여 워크플로우를 구성하고, Bedrock의 Claude 3.7을 활용하여 자연어 처리를 수행합니다.
 
+<img width="1315" height="399" alt="image" src="https://github.com/user-attachments/assets/e73c4c20-3161-4e7a-910b-38286cd4f11a" />
+
+<img width="875" height="522" alt="image" src="https://github.com/user-attachments/assets/4d20f9d8-5e85-434e-a8b4-bb1b52c054a4" />
+
+
 ## 주요 기능
 
 - 자연어 요청을 Redshift SQL로 변환
