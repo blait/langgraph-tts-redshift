@@ -4,7 +4,8 @@
 
 <img width="1315" height="399" alt="image" src="https://github.com/user-attachments/assets/e73c4c20-3161-4e7a-910b-38286cd4f11a" />
 
-<img width="875" height="522" alt="image" src="https://github.com/user-attachments/assets/4d20f9d8-5e85-434e-a8b4-bb1b52c054a4" />
+<img width="1312" height="520" alt="image" src="https://github.com/user-attachments/assets/e1b68029-c3c9-43c1-a312-9f9aff548014" />
+
 
 
 ## 주요 기능
